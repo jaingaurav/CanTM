@@ -20,6 +20,9 @@
 #include "llvm/Instructions.h"
 #include "llvm/Constants.h"
 #include "llvm/Support/CFG.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/AliasSetTracker.h"
+#include "llvm/LLVMContext.h"
 #include <map>
 #include <queue>
 #include <vector>
@@ -29,34 +32,97 @@
 using namespace llvm;
 
 #define DEBUG_INFO 1
+#define MY_ALIAS_SET 0
 
-STATISTIC(CanTMCounter, "Counts number of functions greeted");
+STATISTIC(num_loads,    "Number of Loads (total)");
+STATISTIC(num_loads_from_function_call, "Number of Loads from function calls");
+STATISTIC(num_loads_skipped, "Number of Loads skipped (total)");
+STATISTIC(num_loads_skipped_from_previous_store, "Number of Loads skipped from previous store");
+STATISTIC(num_loads_unprocessed, "Number of Loads unprocessed");
+STATISTIC(num_loads_compressed, "Number of Loads compressed");
+STATISTIC(num_loads_compressed_from_previous_store, "Number of Loads compressed from previous store");
+STATISTIC(num_stores,    "Number of Stores (total)");
+STATISTIC(num_stores_skipped, "Number of Stores skipped (total)");
+STATISTIC(num_stores_unprocessed, "Number of Stores unprocessed");
+STATISTIC(num_stores_compressed, "Number of Stores compressed");
+STATISTIC(aliased_total, "Number of Aliased values - Total");
+STATISTIC(aliased_to_escape, "Number of Aliased values - Escaped");
+STATISTIC(aliased_to_not_escape, "Number of Aliased values - Not escaped");
 
 namespace {
-    unsigned num_loads;
-    unsigned num_loads_from_function_call;
-    unsigned num_loads_skipped;
-    unsigned num_loads_skipped_from_previous_store;
-    unsigned num_loads_unprocessed;
-    unsigned num_loads_compressed;
-    unsigned num_loads_compressed_from_previous_store;
-    unsigned num_stores;
-    unsigned num_stores_skipped;
-    unsigned num_stores_unprocessed;
-    unsigned num_stores_compressed;
+    void printVal(Value *v); 
+    void printInst(Instruction *I, bool var = false); 
+    void printUser(User *u); 
 
-    void printVal(Value *v);
+#if MY_ALIAS_SET
+    class AliasSet {
+        public:
+            std::set<Value *> fValues;
+
+            AliasSet() : fEscapability(true), fProcessedCount(0) { }
+            ~AliasSet() {
+                if (fEscapability) {
+                    aliased_to_escape -= fValues.size();
+                } else {
+                    aliased_to_not_escape -= fValues.size();
+                }
+            }
+            bool processed() { return fValues.size() == fProcessedCount; }
+            void updateEscapability(bool escapability) {
+                if (fProcessedCount > 0) {
+                    assert(fEscapability == escapability);
+                } else {
+                    fEscapability = escapability;
+                }
+                ++fProcessedCount;
+
+                if (fEscapability) {
+                    ++aliased_to_escape;
+                } else {
+                    ++aliased_to_not_escape;
+                }
+
+                assert(fProcessedCount <= fValues.size());
+            } 
+
+            bool getEscapability() {
+                assert(fProcessedCount > 0);
+                return fEscapability;
+            }
+
+        private:
+            bool fEscapability;
+            unsigned fProcessedCount;
+    };
+#endif
 
     class LoadStore {
         std::set<Value*> loads;
         std::set<Value*> stores;
-        std::set<Value*> pred_loads;
-        std::set<Value*> pred_stores;
-        
-      public:
+        std::set<Value*> orig_loads;
+        std::set<Value*> orig_stores;
+
+        public:
 
         bool empty() {
             return loads.empty() && stores.empty();
+        }
+
+
+        bool containsLoadTo(Value *v) {
+            if (orig_loads.find(v) == orig_loads.end()) {
+                return false;
+            }
+
+            return true;
+        }
+
+        bool containsStoreFrom(Value *v) {
+            if (orig_stores.find(v) == orig_stores.end()) {
+                return false;
+            }
+
+            return true;
         }
 
         bool insertLoad(Value *v) {
@@ -71,6 +137,11 @@ namespace {
         bool insertStore(Value *v) {
             std::pair<std::set<Value*>::iterator,bool> ret = stores.insert(v);
             return ret.second;
+        }
+
+        void doneProcessing() {
+            orig_loads = loads;
+            orig_stores = stores;
         }
 
         bool compressWithPreviousLoad(Value* v);
@@ -125,24 +196,349 @@ namespace {
         static char ID; // Pass identification, replacement for typeid
         CanTM() : ModulePass(ID) {}
 
-        void analyizeBB(BasicBlock *bb);
+        void analyizeBB(BasicBlock *bb, AliasSetTracker* aliasTracker);
         void getLoadsStores(BasicBlock *bb, std::set<Value*> &loads, std::set<Value*> &stores);
-        void compressFunction(Function *f);
+        void compressFunction(Function *f, std::set<unsigned> &reservedLoads, std::set<unsigned> &reservedStores);
+        bool canEscape(Value *v);
+        bool computeEscape(Value *v);
+        void updateEscapability(Value *v, bool escapable);
+        bool insertAlias(Value *from, Value *to);
+#if MY_ALIAS_SET
+        AliasSet* findAndUpdateAliasSet(Value* v, bool quickCheck = true);
+        std::map<Value*, AliasSet*> fAliases;
+#endif
         std::map<BasicBlock *, LoadStore> bbMap;
+        std::map<Function *, AliasSetTracker *> aliasMap;
+        std::map<Value *, bool> fCanEscape;
         std::set<Function *> fAdded;
         std::set<BasicBlock *> fFunctionBlocks;
         std::queue<Function *> fQueue;
 
         virtual bool runOnModule(Module &M);
+        virtual void getAnalysisUsage(AnalysisUsage &AU) const {
+            //BasicBlockPass::getAnalysisUsage(AU);
+            AU.addRequired<AliasAnalysis>();
+            AU.addPreserved<AliasAnalysis>();
+        }
+
 
         Function *stm_reserve;
         Function *tx;
+        AliasAnalysis *AA;
     };
 }
 
 char CanTM::ID = 0;
+#if 1
 static RegisterPass<CanTM> X("CanTM", "CanTM World Pass");
+#else
+static const char CanTM_name[] = "CanTM World Pass";
+INITIALIZE_PASS_BEGIN(CanTM, "CanTM", CanTM_name, false, false)
+INITIALIZE_AG_DEPENDENCY(AliasAnalysis)
+    INITIALIZE_PASS_END(CanTM, "CanTM", CanTM_name, false, false)
+#endif
 
+    namespace {
+        void printVal(Value *v) {
+            errs() << "Defining (";
+            if (Instruction *I  = dyn_cast<Instruction>(v)) {
+                printInst(I);
+            } else {
+                errs() << "NOPE";
+            }
+            errs() << ")";
+            const Type* type = v->getType();
+            if (type->isIntegerTy()) {
+                errs() << "Integer" << type->getIntegerBitWidth() << "(";
+                if (ConstantInt  *ci = dyn_cast<ConstantInt>(&*v)) {
+                    errs() << ci->getZExtValue();
+                }
+            } else if (type->isPointerTy()) {
+                errs() << "Pointer(";
+                errs().write_escaped(v->getName());
+            } else if (type->isFunctionTy()) {
+                errs() << "Function(";
+                errs().write_escaped(v->getName());
+            } else {
+                errs() << "Unknown(";
+            }
+            errs() << ")";
+        }
+
+        void printInst(Instruction *I, bool var) {
+            if (LoadInst *li = dyn_cast<LoadInst>(I)) {
+                errs() << "LoadInst";
+                if (var) {
+                    errs() << " ";
+                    printVal(li->getPointerOperand());
+                }
+            } else if (isa<AllocaInst>(I)) {
+                errs() << "AllocaInst";
+            } else if (isa<ReturnInst>(I)) {
+                errs() << "ReturnInst"; 
+            } else if (StoreInst *si = dyn_cast<StoreInst>(I)) {
+                errs() << "StoreInst";
+                if (var) {
+                    errs() << " ";
+                    printVal(si->getValueOperand());
+                    errs() << " ";
+                    printVal(si->getPointerOperand());
+                }
+            } else  if (CallInst *ci = dyn_cast<CallInst>(I)) {
+                errs() << "CallInst";
+                if (var) {
+                    errs() << " (" << ci->getNumArgOperands() << " args) ";
+                    for (unsigned arg_num = 0; arg_num < ci->getNumArgOperands(); ++arg_num) {
+                        errs() << arg_num << ": ";
+                        printVal(ci->getArgOperand(arg_num));
+                        errs() << " ";
+                    }
+                }
+            } else if (isa<BinaryOperator>(I)) {
+                errs() << "BinaryOperator";
+            } else if (isa<UnaryInstruction>(I)) {
+                errs() << "UnaryInstruction";
+            } else if (isa<SelectInst>(I)) {
+                errs() << "SelectInst";
+            } else if (isa<TerminatorInst>(I)) {
+                errs() << "TerminatorInst";
+            } else if (isa<PHINode>(I)) {
+                errs() << "PHINode";
+            } else {
+                errs() << "Unknown";
+            }
+        }
+
+        void printUser(User *u) {
+            if (Instruction *i = dyn_cast<Instruction>(u)) {
+                printInst(i);
+            } else {
+                errs() << "Unknown User";
+            }
+        }
+    }
+/*
+   AliasSet* CanTM::insertAlias(Value *from, Value *to) {
+   AliasSet * as = 0;
+   auto from_it = fAliases.find(from);
+   auto to_it = fAliases.find(to);
+   if (from_it != fAliases.end()) {
+   AliasSet *from_as = (*from_it).second;
+   if (to_it != fAliases.end()) {
+   AliasSet *to_as = (*to_it).second;
+   for (auto set_it = from_as->fValues.begin(), set_it_end = from_as->fValues.end(); set_it != set_it_end; ++set_it) {
+   Value *v = *set_it;
+   fAliases[v] = to_as;
+   to_as->fValues.insert(v);
+   auto it = fCanEscape.find(v);
+   if (it != fCanEscape.end()) {
+   if ((*it).second) {
+   to_as->fCanEscape = true;
+   ++to_as->fProcessedCount;
+   }
+   }
+   }
+   as = to_as;
+   delete from_as;
+   } else {
+   fAliases[to] = from_as;
+   from_as->fValues.insert(to);
+   auto it = fCanEscape.find(to);
+   if (it != fCanEscape.end()) {
+   if ((*it).second) {
+   from_as->fCanEscape = true;
+   ++from_as->fProcessedCount;
+}
+}
+as = from_as;
+}
+} else if (to_it != fAliases.end()) {
+    AliasSet *to_as = (*to_it).second;
+    fAliases[from] = to_as;
+    to_as->fValues.insert(from);
+    auto it = fCanEscape.find(from);
+    if (it != fCanEscape.end()) {
+        if ((*it).second) {
+            to_as->fCanEscape = true;
+            ++to_as->fProcessedCount;
+        }
+    }
+    as = to_as;
+} else {
+    as = new AliasSet();
+    fAliases[from] = as;
+    as->fValues.insert(from);
+    auto it = fCanEscape.find(from);
+    if (it != fCanEscape.end()) {
+        if ((*it).second) {
+            as->fCanEscape = true;
+            ++as->fProcessedCount;
+        }
+    }
+    fAliases[to] = as;
+    as->fValues.insert(to);
+    it = fCanEscape.find(to);
+    if (it != fCanEscape.end()) {
+        if ((*it).second) {
+            as->fCanEscape = true;
+            ++as->fProcessedCount;
+        }
+    }
+}
+return as->fCanEscape;
+}
+*/
+
+#if MY_ALIAS_SET
+AliasSet* CanTM::findAndUpdateAliasSet(Value* v, bool quickCheck) {
+    AliasSet *as = 0;
+    auto as_it = fAliases.find(v);
+    if (as_it != fAliases.end()) {
+        as = (*as_it).second;
+    }
+    if (quickCheck) {
+        return as;
+    }
+
+    for (auto use_iter = v->use_begin(), use_iter_end = v->use_end(); use_iter != use_iter_end; ++use_iter) {
+        if (StoreInst *si = dyn_cast<StoreInst>(*use_iter)) {
+            auto valueOp = si->getValueOperand();
+            auto pointerOp = si->getPointerOperand();
+            Value * newVal = 0;
+            if ((valueOp == v) && (!as || (as->fValues.find(pointerOp) == as->fValues.end()))) {
+                newVal = pointerOp;
+            } else if ((pointerOp == v) && (!as || (as->fValues.find(valueOp) == as->fValues.end()))) {
+                newVal = valueOp;
+            }
+            if (newVal
+                && valueOp->getType()->isPointerTy()
+                && pointerOp->getType()->isPointerTy()) {
+                errs() << "Alias from :"; 
+                errs().write_escaped(pointerOp->getName());
+                errs() << " to ";
+                errs().write_escaped(valueOp->getName());
+                errs() << "\n";
+                auto as_it = fAliases.find(newVal);
+                if (as_it != fAliases.end()) {
+                    if (as) {
+                        AliasSet *old_as = (*as_it).second;
+                        for (auto set_it = old_as->fValues.begin(), set_it_end = old_as->fValues.end(); set_it != set_it_end; ++set_it) {
+                            Value *old_v = *set_it;
+                            fAliases[old_v] = as;
+                            as->fValues.insert(old_v);
+                            auto it = fCanEscape.find(old_v);
+                            if (it != fCanEscape.end()) {
+                                as->updateEscapability((*it).second);
+                            }
+                        }
+                        delete old_as;
+                    } else {
+                        as = (*as_it).second;
+                        fAliases[v] = as;
+                        as->fValues.insert(v);
+                        ++aliased_total;
+                    }
+                } else {
+                    if (!as) {
+                        as = new AliasSet();
+                        fAliases[v] = as;
+                        as->fValues.insert(v);
+                        ++aliased_total;
+                    }
+                    fAliases[newVal] = as;
+                    as->fValues.insert(newVal);
+                    ++aliased_total;
+                    findAndUpdateAliasSet(newVal, false);
+                }
+            }
+        }
+        // TODO: Support aliasing of function return values
+#if 0
+        if (ReturnInst *ri = dyn_cast<ReturnInst>(*use_iter)) {
+            auto retVal = ri->getReturnValue();
+            if (retVal == v && retVal->getType()->isPointerTy()) {
+                errs() << "Can Escape!";
+                fCanEscape[v] = true;
+                return true;
+            }
+        }
+#endif
+    }
+
+    return as;
+}
+#endif
+
+bool CanTM::canEscape(Value *v) {
+#if MY_ALIAS_SET
+    auto as_it = fAliases.find(v);
+    if (as_it != fAliases.end()) {
+        AliasSet *as = (*as_it).second;
+        return as->getEscapability();
+    }
+#endif
+
+    auto it = fCanEscape.find(v);
+    if (it != fCanEscape.end()) {
+        return (*it).second;
+    }
+
+    return false;
+}
+
+void CanTM::updateEscapability(Value *v, bool escapable) {
+    // Check if value has already been processed
+    auto it = fCanEscape.find(v);
+    if (it == fCanEscape.end()) {
+        fCanEscape[v] = escapable;
+    }
+#if MY_ALIAS_SET
+    AliasSet *as = findAndUpdateAliasSet(v, false);
+    if (as) {
+        as->updateEscapability(escapable);
+    }
+#endif
+}
+/*
+   bool CanTM::computeEscape(Value *v) {
+   auto it = fCanEscape.find(v);
+   if (it != fCanEscape.end()) {
+   return (*it).second;
+   }
+   errs() << "computeEscape(";
+   errs().write_escaped(v->getName());
+   errs() << ") ";
+   for (auto use_iter = v->use_begin(), use_iter_end = v->use_end(); use_iter != use_iter_end; ++use_iter) {
+   errs() << "Inst:";
+   printUser(*use_iter);
+   if (ReturnInst *ri = dyn_cast<ReturnInst>(*use_iter)) {
+   auto retVal = ri->getReturnValue();
+   if (retVal == v && retVal->getType()->isPointerTy()) {
+   errs() << "Can Escape!";
+   fCanEscape[v] = true;
+   return true;
+   }
+   } else if (StoreInst *si = dyn_cast<StoreInst>(*use_iter)) {
+   auto valueOp = si->getValueOperand();
+   auto pointerOp = si->getPointerOperand();
+   if (pointerOp == v && pointerOp->getType()->isPointerTy() && valueOp->getType()->isPointerTy()) {
+   errs() << "Alias from :"; 
+   errs().write_escaped(pointerOp->getName());
+   errs() << " to ";
+   errs().write_escaped(valueOp->getName());
+   if (insertAlias(v, valueOp)) {
+   fCanEscape[v] = true;
+   return true;
+   }
+}
+}
+errs() << " ";
+}
+
+errs() << "Cannot Escape!";
+fCanEscape[v] = false;
+return false;
+}*/
 
 bool LoadStore::compressWithPreviousLoad(Value* v) {
     auto loads_it = loads.find(v);
@@ -154,12 +550,18 @@ bool LoadStore::compressWithPreviousLoad(Value* v) {
 #endif
         ++num_loads_compressed;
         loads.erase(loads_it);
+        return true;
     }
+    return false;
 }
 
 bool LoadStore::compressWithPreviousStore(Value* v) {
-    if (compressWithPreviousLoad(v))
+    bool retVal = false;
+
+    if (compressWithPreviousLoad(v)) {
         ++num_loads_compressed_from_previous_store;
+        retVal = true;
+    }
 
     auto stores_it = stores.find(v);
     if (stores_it != stores.end()) {
@@ -170,7 +572,10 @@ bool LoadStore::compressWithPreviousStore(Value* v) {
 #endif
         ++num_stores_compressed;
         stores.erase(stores_it);
+        retVal = true;
     }
+
+    return retVal;
 }
 
 void LoadStore::compress(std::set<Value*> &prev_loads, std::set<Value*> &prev_stores) {
@@ -181,33 +586,16 @@ void LoadStore::compress(std::set<Value*> &prev_loads, std::set<Value*> &prev_st
         compressWithPreviousStore(*stores_it);
 }
 
-namespace {
-void printVal(Value *v) {
-    const Type* type = v->getType();
-    if (type->isIntegerTy()) {
-        errs() << "Integer" << type->getIntegerBitWidth() << "(";
-        if (ConstantInt  *ci = dyn_cast<ConstantInt>(&*v)) {
-            errs() << ci->getZExtValue();
-        }
-    } else if (type->isPointerTy()) {
-        errs() << "Pointer(";
-        errs().write_escaped(v->getName());
-    } else {
-        errs() << "Unknown(";
-    }
-    errs() << ")";
-}
-}
-
-void CanTM::analyizeBB(BasicBlock *bb) {
+void CanTM::analyizeBB(BasicBlock *bb, AliasSetTracker* aliasTracker) {
     errs() << "BB: " << bb << "\n";
     LoadStore ls;
     for (auto instr_i = bb->begin(), instr_e = bb->end(); instr_i != instr_e; ++instr_i) {
         errs() << "Intr: ";
+        printInst(&*instr_i, true);
         if (LoadInst *li = dyn_cast<LoadInst>(&*instr_i)) {
+            //if (!computeEscape(li->getPointerOperand())) {
+            //}
             ++num_loads;
-            errs() << "Load ";
-            printVal(li->getPointerOperand());
             if (li->getPointerOperand()->hasName()) {
                 if (!ls.insertLoad(li->getPointerOperand())) {
                     ++num_loads_skipped;
@@ -215,28 +603,40 @@ void CanTM::analyizeBB(BasicBlock *bb) {
             } else {
                 ++num_loads_unprocessed;
             }
+
+            AliasSet* as = aliasTracker->getAliasSetForPointerIfExists(li, AA->getTypeStoreSize(li->getType()), li->getMetadata(LLVMContext::MD_tbaa));
+            if (as) {
+                errs() << "Value: (";
+                printVal(li);
+                errs() << ") has alias set\n";
+            } else {
+                errs() << "Value: (";
+                printVal(li);
+                errs() << ") has NO alias set\n";
+            }
         } else if (StoreInst *si = dyn_cast<StoreInst>(&*instr_i)) {
             ++num_stores;
-            errs() << "Store ";
-            printVal(si->getValueOperand());
-            errs() << " ";
-            printVal(si->getPointerOperand());
-            if (si->getPointerOperand()->hasName()) {
-                if (!ls.insertStore(si->getPointerOperand())) {
+            auto valueOp = si->getValueOperand();
+            auto pointerOp = si->getPointerOperand();
+            if (pointerOp->hasName()) {
+                //if (!computeEscape(pointerOp)) {
+                //}
+                /*
+                   if (valueOp->getType()->isPointerTy() && valueOp->hasName()) {
+                   ls.insertAlias()
+                   ++num_stores_aliased;
+                   }*/
+                if (!ls.insertStore(pointerOp)) {
                     ++num_stores_skipped;
                 }
             } else {
                 ++num_stores_unprocessed;
             }
         } else if (CallInst *ci = dyn_cast<CallInst>(&*instr_i)) {
-            errs() << "Call (" << ci->getNumArgOperands() << " args) ";
             if (instr_i != bb->begin()) {
-                analyizeBB(bb->splitBasicBlock(instr_i));
+                analyizeBB(bb->splitBasicBlock(instr_i), aliasTracker);
             } else {
                 for (unsigned arg_num = 0; arg_num < ci->getNumArgOperands(); ++arg_num) {
-                    errs() << arg_num << ": ";
-                    printVal(ci->getArgOperand(arg_num));
-                    errs() << " ";
                     ++num_loads;
                     ++num_loads_from_function_call;
                     if (ci->getArgOperand(arg_num)->hasName()) {
@@ -256,23 +656,43 @@ void CanTM::analyizeBB(BasicBlock *bb) {
                 }
                 ++instr_i;
                 if (instr_i != instr_e)
-                    analyizeBB(bb->splitBasicBlock(instr_i));
+                    analyizeBB(bb->splitBasicBlock(instr_i), aliasTracker);
             }
             break;
         } else if (AllocaInst *ai = dyn_cast<AllocaInst>(&*instr_i)) {
-            errs() << "Alloc";
+            AliasSet* as = aliasTracker->getAliasSetForPointerIfExists(ai, AA->getTypeStoreSize(ai->getType()), ai->getMetadata(LLVMContext::MD_tbaa));
+            if (as) {
+                errs() << "Value: (";
+                printVal(ai);
+                errs() << ") has alias set\n";
+            } else {
+                errs() << "Value: (";
+                printVal(ai);
+                errs() << ") has NO alias set\n";
+            }
+#if MY_ALIAS_SET
+            AliasSet* as = findAndUpdateAliasSet(ai, false);
+            if (as) {
+                errs() << "Value: (";
+                printVal(ai);
+                errs() << ") has alias set\n";
+            } else {
+                errs() << "Value: (";
+                printVal(ai);
+                errs() << ") has NO alias set\n";
+            }
+#endif
             ++instr_i;
             if (instr_i != instr_e)
-                analyizeBB(bb->splitBasicBlock(instr_i));
+                analyizeBB(bb->splitBasicBlock(instr_i), aliasTracker);
             break;
-        } else {
-            errs() << "Unknown";
         }
         errs() << "\n";
     }
     if (!ls.empty()) {
         errs() << "Analyized BB: " << bb << " ";
         ls.debugPrint();
+        ls.doneProcessing();
         bbMap[bb] = ls;
     }
 }
@@ -307,34 +727,57 @@ void CanTM::getLoadsStores(BasicBlock *bb, std::set<Value*> &loads, std::set<Val
     if (fFunctionBlocks.find(bb) != fFunctionBlocks.end()) {
         auto instr_i = bb->begin();
         CallInst *ci = dyn_cast<CallInst>(&*instr_i);
-        compressFunction(ci->getCalledFunction());
+        std::set<unsigned> reservedLoads;
+        std::set<unsigned> reservedStores;
+        errs() << "Call Inst has " << ci->getNumArgOperands() << " args) ";
+        for (unsigned arg_num = 0; arg_num < ci->getNumArgOperands(); ++arg_num) {
+            errs() << arg_num << ": ";
+            printVal(ci->getArgOperand(arg_num));
+            if (ls.containsLoadTo(ci->getArgOperand(arg_num))) {
+                errs() << " LoadReserved ";
+                reservedLoads.insert(arg_num);
+            }
+            if (ls.containsStoreFrom(ci->getArgOperand(arg_num))) {
+                errs() << "StoreReserved ";
+                reservedStores.insert(arg_num);
+            }
+
+            errs() << " ";
+        }
+        compressFunction(ci->getCalledFunction(), reservedLoads, reservedStores);
     }
 
     ls.copyLoads(loads);
     ls.copyStores(stores);
-   /* 
-    for (auto loads_it = ls.loads.begin(), loads_it_e = ls.loads.end(); loads_it != loads_it_e; ++loads_it) {
-        loads.insert(*loads_it);
-    }
-    for (auto stores_it = ls.stores.begin(), stores_it_e = ls.stores.end(); stores_it != stores_it_e; ++stores_it) {
-        stores.insert(*stores_it);
-    }*/
     errs() << "Compressed BB (end): " << bb << " ";
     ls.debugPrint();
     //loads.insert(ls.loads.begin(), ls.loads.end());
     //stores.insert(ls.stores.begin(), ls.stores.end());
 }
 
-void CanTM::compressFunction(Function *f) {
+void CanTM::compressFunction(Function *f, std::set<unsigned> &reservedLoads, std::set<unsigned> &reservedStores) {
+    errs() << "=========================\n";
+    errs() << "Compressing Func: ";
+    errs().write_escaped(f->getName()) << '\n';
+    errs() << "=========================\n";
+    unsigned i = 0;
     for (auto arg_iter=f->arg_begin(), arg_iter_end = f->arg_end(); arg_iter != arg_iter_end; ++arg_iter) {
+        errs() << "Arg " << i << " ";
+        printVal(arg_iter);
         for (auto i_f = f->begin(), ie_f = f->end(); i_f != ie_f; i_f++) {
             BasicBlock *bb = i_f;
             LoadStore ls = bbMap[bb];
             // TODO: FIXME For now we'll assume all arguments are properly reserved
-            ls.compressWithPreviousLoad(arg_iter);
-            ls.compressWithPreviousStore(arg_iter);
+            if (ls.compressWithPreviousLoad(arg_iter)) {
+                errs() << "Load compressed BB: (" << bb << ") ";
+            }
+            if (ls.compressWithPreviousStore(arg_iter)) {
+                errs() << "Load compressed BB: (" << bb << ") ";
+            }
             bbMap[bb] = ls;
         }
+        errs() << "\n";
+        ++i;
     }
 
     // TODO: There may be multiple ending blocks
@@ -347,19 +790,22 @@ void CanTM::compressFunction(Function *f) {
 }
 
 bool CanTM::runOnModule(Module &M) {
-    ++CanTMCounter;
-    errs() << "CanTM: ";
-    stm_reserve = M.begin();
+    AA = &getAnalysis<AliasAnalysis>();
+    errs() << "Processing Module: ";
     errs().write_escaped(M.getModuleIdentifier()) << '\n';
+
+    //TODO: Link to library
+    stm_reserve = M.begin();
+
+    // Automatically add *foo*() and *tx*() functions to system
+    // TODO: Use clang to insert LLVM instructions to start/end a transaction
     for (auto i = M.begin(), ie = M.end(); i != ie; ++i) {
         Function* f = i;
-        /*
-           errs() << "=========================\n";
-           errs() << "Func: ";
-           errs().write_escaped(f->getName()) << '\n';
-           errs() << "=========================\n";
-           errs() << "onlyReadsMemory: " << f->onlyReadsMemory() << '\n';
-           */
+        if (f->getName().str().find("foo") != std::string::npos) {
+            fQueue.push(f);
+            fAdded.insert(f);
+            tx = f;
+        }
         if (f->getName().str().find("tx") != std::string::npos) {
             fQueue.push(f);
             fAdded.insert(f);
@@ -368,28 +814,39 @@ bool CanTM::runOnModule(Module &M) {
         }
     }
 
+    // Mark all globals as escapable, including all aliases
+    // TODO: If a global is accessed by a single transaction it
+    // doesn't need to be marked as so
+    for (Module::global_iterator G = M.global_begin(), E = M.global_end();
+        G != E; ++G) {
+        updateEscapability(G, true);
+    }
+
+    // Process each function
     while (!fQueue.empty()) {
         Function* f = fQueue.front();
         fQueue.pop();
-
 
         errs() << "=========================\n";
         errs() << "Processing Func: ";
         errs().write_escaped(f->getName()) << '\n';
         errs() << "=========================\n";
-
+        AliasSetTracker* aliasTracker = new AliasSetTracker(*AA);
+        for (auto i_f = f->begin(), ie_f = f->end(); i_f != ie_f; i_f++) {
+            //aliasTracker->add(*i_f);
+        }
         for (auto i_f = f->begin(), ie_f = f->end(); i_f != ie_f; i_f++) {
             BasicBlock *bb = i_f;
-            analyizeBB(bb);
+            analyizeBB(bb, aliasTracker);
         }
-        for (Value::use_iterator j = f->use_begin(), je = f->use_end(); j != je; ++j) {
-            Value *v = *j;
-            errs() << "Value: ";
-            errs().write_escaped(v->getName()) << '\n';
-        }
+        aliasMap[f] = aliasTracker;
     }
 
-    compressFunction(tx);
+    // Start off by compressing the root tx function,
+    // this should in turn compress the subsequent ones
+    std::set<unsigned> reservedLoads;
+    std::set<unsigned> reservedStores;
+    compressFunction(tx, reservedLoads, reservedStores);
 
     for (auto it = bbMap.begin(), it_end = bbMap.end(); it != it_end; ++it) {
         BasicBlock *bb = (*it).first;
@@ -408,24 +865,13 @@ bool CanTM::runOnModule(Module &M) {
         args.push_back(num_stores);
         ls.copyStores(args);
         auto InsertPos = bb->begin();
+        while (isa<PHINode>(InsertPos))
+            ++InsertPos;
 
         CallInst::Create(stm_reserve, args, "", InsertPos);
     }
 
-    errs() << "==========\n";
-    errs() << "Statistics\n";
-    errs() << "==========\n";
-    errs() << "Num Loads: " << num_loads << "\n";
-    errs() << "Num Loads from function calls: " << num_loads_from_function_call << "\n";
-    errs() << "Num Loads skipped: " << num_loads_skipped << "\n";
-    errs() << "          skipped from previous store: " << num_loads_skipped_from_previous_store << "\n";
-    errs() << "Num Loads unprocessed: " << num_loads_unprocessed << "\n";
-    errs() << "Num Loads compressed: " << num_loads_compressed << "\n";
-    errs() << "          compressed from previous store: " << num_loads_compressed_from_previous_store << "\n";
-    errs() << "Num Stores: " << num_stores << "\n";
-    errs() << "Num Stores skipped: " << num_stores_skipped << "\n";
-    errs() << "Num Stores unprocessed: " << num_stores_unprocessed << "\n";
-    errs() << "Num Stores compressed: " << num_stores_compressed << "\n";
 
+    // TODO: return false if no changes were made
     return true;
 }

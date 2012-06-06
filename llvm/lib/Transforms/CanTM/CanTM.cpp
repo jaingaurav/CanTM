@@ -575,24 +575,24 @@ void CanTM::compressFunction(Function *f, std::set<unsigned> &reservedLoads, std
     errs() << "Compressing Func: ";
     errs().write_escaped(f->getName()) << '\n';
     errs() << "=========================\n";
-    unsigned i = 0;
+    unsigned arg_index = 0;
     for (auto arg_iter=f->arg_begin(), arg_iter_end = f->arg_end(); arg_iter != arg_iter_end; ++arg_iter) {
-        errs() << "Arg " << i << " ";
+        errs() << "Arg " << arg_index << " ";
         printVal(arg_iter);
         for (auto i_f = f->begin(), ie_f = f->end(); i_f != ie_f; i_f++) {
             BasicBlock *bb = i_f;
             LoadStore ls = bbMap[bb];
             // TODO: FIXME For now we'll assume all arguments are properly reserved
-            if (ls.compressWithPreviousLoad(arg_iter)) {
+            if ((reservedLoads.find(arg_index) != reservedLoads.end()) && ls.compressWithPreviousLoad(arg_iter)) {
                 errs() << "Load compressed BB: (" << bb << ") ";
             }
-            if (ls.compressWithPreviousStore(arg_iter)) {
+            if ((reservedStores.find(arg_index) != reservedStores.end()) && ls.compressWithPreviousStore(arg_iter)) {
                 errs() << "Load compressed BB: (" << bb << ") ";
             }
             bbMap[bb] = ls;
         }
         errs() << "\n";
-        ++i;
+        ++arg_index;
     }
 
     // TODO: There may be multiple ending blocks
